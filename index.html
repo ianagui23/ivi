@@ -119,6 +119,356 @@
     }
   </script>
 
+  <!-- Motor de sincronizacion con Supabase (tabla apto_docs) -->
+  <script>
+  // =========================================================================
+  // AptoCloud: sincronizacion fila por fila con Supabase (tabla public.apto_docs)
+  // Cada producto, venta, cliente y usuario es una fila (collection + id).
+  // =========================================================================
+  window.AptoCloud = (function () {
+    const TABLE = 'apto_docs';
+    const COLLECTIONS = ['products', 'sales', 'clients', 'users'];
+    const PAGE = 1000;
+    const CHUNK = 200;
+    const OVERLAP_MS = 5000;
+    const has = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+
+    // JSON estable (claves ordenadas) para comparar objetos aunque Postgres reordene las claves
+    function stable(v) {
+      if (v === null || typeof v !== 'object') return JSON.stringify(v);
+      if (typeof v.toJSON === 'function') return stable(v.toJSON());
+      if (Array.isArray(v)) {
+        return '[' + v.map(function (x) { const s = stable(x); return s === undefined ? 'null' : s; }).join(',') + ']';
+      }
+      const parts = [];
+      Object.keys(v).sort().forEach(function (k) {
+        const s = stable(v[k]);
+        if (s !== undefined) parts.push(JSON.stringify(k) + ':' + s);
+      });
+      return '{' + parts.join(',') + '}';
+    }
+
+    // Hash corto (cyrb53) de la version de un registro
+    function hash(str) {
+      let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+      for (let i = 0, ch; i < str.length; i++) {
+        ch = str.charCodeAt(i);
+        h1 = Math.imul(h1 ^ ch, 2654435761);
+        h2 = Math.imul(h2 ^ ch, 1597334677);
+      }
+      h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+      h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+      return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
+    }
+    const sig = function (item) { return hash(stable(item)); };
+
+    function newestFirst(a, b) {
+      const ka = String(a.date || a.createdAt || '');
+      const kb = String(b.date || b.createdAt || '');
+      return ka < kb ? 1 : ka > kb ? -1 : 0;
+    }
+
+    // Aplica cambios remotos a una lista local: reemplaza, elimina y antepone lo nuevo
+    function mergeList(prev, ch) {
+      const up = new Map();
+      ch.upserts.forEach(function (x) { up.set(String(x.id), x); });
+      const del = new Set(ch.deletes.map(String));
+      const seen = new Set();
+      const out = [];
+      (prev || []).forEach(function (it) {
+        const id = String(it.id);
+        if (del.has(id)) return;
+        if (up.has(id)) { out.push(up.get(id)); seen.add(id); } else { out.push(it); }
+      });
+      const fresh = ch.upserts.filter(function (x) { return !seen.has(String(x.id)); });
+      return fresh.concat(out);
+    }
+
+    function create(opts) {
+      const client = opts.client;
+      const getLocal = opts.getLocal;
+      const onRemote = opts.onRemote;
+      const pristine = opts.pristine || {};
+      const pollMs = opts.pollMs || 10000;
+      const storage = opts.storage !== undefined ? opts.storage : (typeof localStorage !== 'undefined' ? localStorage : null);
+      const storageKey = 'apto_cloud_synced_v1:' + (opts.scope || '');
+
+      // synced[coll][id] = hash de la ultima version que sabemos que esta en la nube
+      const synced = {};
+      COLLECTIONS.forEach(function (c) { synced[c] = {}; });
+      try {
+        const raw = storage && storage.getItem(storageKey);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          COLLECTIONS.forEach(function (c) { if (parsed && parsed[c]) synced[c] = parsed[c]; });
+        }
+      } catch (e) {}
+      function persist() {
+        try { if (storage) storage.setItem(storageKey, JSON.stringify(synced)); } catch (e) {}
+      }
+
+      let ready = false, stopped = false, flushing = false, again = false, polling = false;
+      let cursor = null, channel = null, pollTimer = null, pushTimer = null, retryTimer = null, pushRetry = null;
+      let lastStatus = null;
+      const deferred = [];
+      const seenErrors = new Set();
+
+      function setStatus(s) {
+        if (s !== lastStatus) { lastStatus = s; if (opts.onStatus) opts.onStatus(s); }
+      }
+
+      function fail(e) {
+        setStatus('offline');
+        const msg = String((e && (e.message || e.details)) || e);
+        const code = e && e.code;
+        let friendly = null;
+        if (code === 'PGRST205' || code === '42P01' || (/apto_docs/.test(msg) && /not find|does not exist/i.test(msg))) {
+          friendly = 'Falta crear la tabla en Supabase: ejecute el archivo apto_nube.sql en el SQL Editor.';
+        } else if (code === '42501' || /row-level security|permission denied/i.test(msg)) {
+          friendly = 'Supabase rechazo el acceso. Ejecute el archivo apto_nube.sql completo en el SQL Editor.';
+        } else if (/invalid api key|apikey|jwt/i.test(msg)) {
+          friendly = 'La clave de Supabase no es valida. Revise la URL y la clave en la configuracion de nube.';
+        }
+        if (friendly && !seenErrors.has(friendly)) {
+          seenErrors.add(friendly);
+          if (opts.onError) opts.onError(friendly);
+        }
+        if (typeof console !== 'undefined') console.warn('[AptoCloud]', e);
+      }
+
+      async function fetchRows(sinceIso) {
+        const rows = [];
+        for (let from = 0; ; from += PAGE) {
+          let q = client.from(TABLE).select('collection,id,data,deleted,updated_at');
+          if (sinceIso) q = q.gte('updated_at', sinceIso);
+          q = q.order('updated_at', { ascending: true })
+               .order('collection', { ascending: true })
+               .order('id', { ascending: true })
+               .range(from, from + PAGE - 1);
+          const res = await q;
+          if (res.error) throw res.error;
+          const data = res.data || [];
+          for (let i = 0; i < data.length; i++) rows.push(data[i]);
+          if (data.length < PAGE) break;
+        }
+        return rows;
+      }
+
+      // Decide que filas de la nube se aplican al estado local
+      function applyRows(rows, initial) {
+        const byColl = {};
+        COLLECTIONS.forEach(function (c) { byColl[c] = []; });
+        rows.forEach(function (r) {
+          if (r.updated_at) {
+            const t = Date.parse(r.updated_at);
+            if (!isNaN(t) && (cursor === null || t > cursor)) cursor = t;
+          }
+          if (byColl[r.collection]) byColl[r.collection].push(r);
+        });
+
+        COLLECTIONS.forEach(function (coll) {
+          const rs = byColl[coll];
+          if (!rs.length && !initial) return;
+          const local = getLocal(coll) || [];
+          const localById = new Map();
+          local.forEach(function (x) { localById.set(String(x.id), x); });
+          const S = synced[coll];
+          const remoteIds = new Set();
+          const upserts = [], deletes = [];
+
+          rs.forEach(function (r) {
+            const id = String(r.id);
+            remoteIds.add(id);
+            const L = localById.get(id);
+            const known = has(S, id);
+
+            if (r.deleted) {
+              if (L && known && sig(L) !== S[id]) return;   // hay una edicion local pendiente: gana la local
+              if (L) deletes.push(id);
+              delete S[id];
+              return;
+            }
+
+            const item = r.data;
+            const rsig = sig(item);
+            if (known && S[id] === rsig) return;             // ya conocemos esta version
+            if (L) {
+              const lsig = sig(L);
+              if (lsig === rsig) { S[id] = rsig; return; }
+              if (known) {
+                if (lsig !== S[id]) return;                  // edicion local pendiente: gana la local
+              } else if (initial && pristine[coll] && pristine[coll][id] === rsig) {
+                return;                                      // la nube tiene el dato de ejemplo sin tocar y aqui fue editado
+              }
+            }
+            S[id] = rsig;
+            upserts.push(item);
+          });
+
+          if (initial) {
+            const collHasRows = rs.length > 0;
+            local.forEach(function (L) {
+              const id = String(L.id);
+              if (remoteIds.has(id)) return;
+              if (has(S, id)) { delete S[id]; return; }      // la nube ya no lo tiene: se vuelve a subir
+              if (collHasRows && pristine[coll] && pristine[coll][id] === sig(L)) {
+                deletes.push(id);                            // dato de ejemplo sin tocar que la nube no tiene: se descarta
+              }
+            });
+          }
+
+          if (upserts.length || deletes.length) {
+            upserts.sort(newestFirst);
+            onRemote(coll, { upserts: upserts, deletes: deletes }, { initial: !!initial });
+          }
+        });
+        persist();
+      }
+
+      function applySafe(rows) {
+        if (flushing) { rows.forEach(function (r) { deferred.push(r); }); return; }
+        applyRows(rows, false);
+      }
+
+      // Calcula que filas hay que subir (nuevas, editadas o eliminadas)
+      function diff() {
+        const rows = [], commits = [];
+        COLLECTIONS.forEach(function (coll) {
+          const list = getLocal(coll) || [];
+          const S = synced[coll];
+          const present = new Set();
+          list.forEach(function (item) {
+            if (!item || item.id === undefined || item.id === null) return;
+            const id = String(item.id);
+            present.add(id);
+            const s = sig(item);
+            if (S[id] !== s) {
+              rows.push({ collection: coll, id: id, data: item, deleted: false });
+              commits.push(function () { S[id] = s; });
+            }
+          });
+          const gone = Object.keys(S).filter(function (id) { return !present.has(id); });
+          // Seguridad: nunca borrar de golpe toda una coleccion (3 o mas registros)
+          if (gone.length >= 3 && gone.length === Object.keys(S).length) {
+            if (typeof console !== 'undefined') console.warn('[AptoCloud] se omitio un borrado masivo en', coll);
+            return;
+          }
+          gone.forEach(function (id) {
+            rows.push({ collection: coll, id: id, data: {}, deleted: true });
+            commits.push(function () { delete S[id]; });
+          });
+        });
+        return { rows: rows, commits: commits };
+      }
+
+      async function flush() {
+        if (!ready || stopped) return;
+        if (flushing) { again = true; return; }
+        flushing = true;
+        try {
+          do {
+            again = false;
+            const d = diff();
+            for (let i = 0; i < d.rows.length; i += CHUNK) {
+              const part = d.rows.slice(i, i + CHUNK);
+              const res = await client.from(TABLE).upsert(part, { onConflict: 'collection,id' });
+              if (res.error) throw res.error;
+              for (let j = i; j < i + part.length; j++) d.commits[j]();
+              persist();
+            }
+          } while (again && !stopped);
+          setStatus('connected');
+        } catch (e) {
+          fail(e);
+          clearTimeout(pushRetry);
+          pushRetry = setTimeout(flush, 6000);
+        } finally {
+          flushing = false;
+          if (deferred.length && !stopped) applyRows(deferred.splice(0, deferred.length), false);
+        }
+      }
+
+      function notify() {
+        if (!ready || stopped) return;
+        clearTimeout(pushTimer);
+        pushTimer = setTimeout(flush, 300);
+      }
+
+      async function poll() {
+        if (!ready || stopped || polling || flushing) return;
+        polling = true;
+        try {
+          const since = cursor !== null ? new Date(cursor - OVERLAP_MS).toISOString() : null;
+          const rows = await fetchRows(since);
+          if (!stopped) {
+            applySafe(rows);
+            setStatus('connected');
+          }
+        } catch (e) {
+          fail(e);
+        } finally {
+          polling = false;
+        }
+      }
+
+      function onVisible() {
+        if (typeof document !== 'undefined' && document.visibilityState === 'visible') poll();
+      }
+
+      function subscribe() {
+        try {
+          channel = client.channel('apto-docs-live')
+            .on('postgres_changes', { event: '*', schema: 'public', table: TABLE }, function (p) {
+              if (stopped) return;
+              if (p.new && p.new.collection) {
+                applySafe([p.new]);
+              } else if (p.old && p.old.collection) {
+                applySafe([{ collection: p.old.collection, id: p.old.id, deleted: true, data: {} }]);
+              }
+            })
+            .subscribe(function (status) {
+              if (status === 'SUBSCRIBED') setStatus('connected');
+            });
+        } catch (e) {}
+      }
+
+      async function start() {
+        if (stopped) return;
+        setStatus('sync');
+        try {
+          const rows = await fetchRows(null);
+          if (stopped) return;
+          applyRows(rows, true);
+          ready = true;
+          setStatus('connected');
+          subscribe();
+          pollTimer = setInterval(poll, pollMs);
+          if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisible);
+          if (typeof window !== 'undefined') window.addEventListener('online', poll);
+          flush();
+        } catch (e) {
+          if (stopped) return;
+          fail(e);
+          retryTimer = setTimeout(start, 8000);
+        }
+      }
+
+      function stop() {
+        stopped = true;
+        clearTimeout(pushTimer); clearTimeout(retryTimer); clearTimeout(pushRetry);
+        clearInterval(pollTimer);
+        if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisible);
+        if (typeof window !== 'undefined') window.removeEventListener('online', poll);
+        try { if (channel) client.removeChannel(channel); } catch (e) {}
+      }
+
+      return { start: start, stop: stop, notify: notify, flush: flush, poll: poll, _synced: synced };
+    }
+
+    return { create: create, mergeList: mergeList, sig: sig, stable: stable };
+  })();
+  </script>
+
   <!-- Main Application Script -->
   <script type="text/babel">
     const { useState, useEffect, useMemo, useRef } = React;
@@ -718,6 +1068,14 @@
       }
     ];
 
+    // --- Conexion a la nube (Supabase) por defecto: todos los equipos usan la misma base ---
+    const CLOUD_DEFAULTS = {
+      url: 'https://ubdhmhvnnfwxzdzibirq.supabase.co',
+      anonKey: 'sb_publishable_xowsJeR0OREBUR_lrytluw_aWlI-co6'
+    };
+    // Acepta la URL con o sin /rest/v1/ al final
+    const normalizeCloudUrl = (u) => (u || '').trim().replace(/\/+$/, '').replace(/\/rest\/v1$/i, '').replace(/\/+$/, '');
+
     // --- Main Application Component ---
     function App() {
       // 1. Mandatory Corporate Access Gate
@@ -727,12 +1085,13 @@
 
       // 2. Cloud Configuration & Realtime Sync State
       const [cloudConfig, setCloudConfig] = useState(() => {
-        const saved = localStorage.getItem('apto_cloud_config');
-        return saved ? JSON.parse(saved) : {
-          url: '',
-          anonKey: '',
-          connected: false
-        };
+        try {
+          const saved = JSON.parse(localStorage.getItem('apto_cloud_config') || 'null');
+          if (saved && saved.url && saved.anonKey) {
+            return { ...saved, url: normalizeCloudUrl(saved.url), connected: true };
+          }
+        } catch (e) {}
+        return { url: CLOUD_DEFAULTS.url, anonKey: CLOUD_DEFAULTS.anonKey, connected: true };
       });
       const [showCloudModal, setShowCloudModal] = useState(false);
       const [cloudSyncStatus, setCloudSyncStatus] = useState('sync'); // 'connected', 'sync', 'offline'
@@ -880,30 +1239,72 @@
           }
         } catch(e) {}
 
-        // 2. Supabase Realtime Subscription if configured
-        if (cloudConfig.url && cloudConfig.anonKey && window.supabase) {
-          try {
-            const supabase = window.supabase.createClient(cloudConfig.url, cloudConfig.anonKey);
-            const sub = supabase.channel('apto-realtime-global')
-              .on('postgres_changes', { event: '*', schema: 'public', table: 'sales' }, (payload) => {
-                if (payload.eventType === 'INSERT') {
-                  showToast(`⚡ Factura #${payload.new.invoice_number} recibida en tiempo real desde la nube`, 'info');
-                }
-              })
-              .subscribe((status) => {
-                if (status === 'SUBSCRIBED') {
-                  setCloudSyncStatus('connected');
-                }
-              });
+        return () => {
+          try { if (broadcastRef.current) broadcastRef.current.close(); } catch (e) {}
+          broadcastRef.current = null;
+        };
+      }, []);
 
-            return () => {
-              supabase.removeChannel(sub);
-            };
-          } catch(err) {
-            setCloudSyncStatus('sync');
-          }
+      // =====================================================================
+      // Sincronizacion con la nube (Supabase): todos los equipos ven lo mismo
+      // =====================================================================
+      const dataRefs = useRef({ products, sales, clients, users });
+      dataRefs.current = { products, sales, clients, users };
+      const cloudRef = useRef(null);
+
+      useEffect(() => {
+        if (!cloudConfig.url || !cloudConfig.anonKey || !window.supabase || !window.AptoCloud) {
+          setCloudSyncStatus('offline');
+          return;
         }
-      }, [cloudConfig]);
+        const setters = { products: setProducts, sales: setSales, clients: setClients, users: setUsers };
+        const pristineOf = (list) => Object.fromEntries(list.map(x => [String(x.id), window.AptoCloud.sig(x)]));
+        let engine = null;
+        try {
+          const client = window.supabase.createClient(cloudConfig.url, cloudConfig.anonKey);
+          engine = window.AptoCloud.create({
+            client,
+            scope: cloudConfig.url,
+            pollMs: window.APTO_POLL_MS || 10000,
+            pristine: {
+              products: pristineOf(INITIAL_PRODUCTS),
+              sales: pristineOf(INITIAL_SALES),
+              clients: pristineOf(INITIAL_CLIENTS),
+              users: pristineOf(INITIAL_USERS)
+            },
+            getLocal: (c) => dataRefs.current[c],
+            onRemote: (c, changes, meta) => {
+              const prevIds = new Set((dataRefs.current[c] || []).map(x => String(x.id)));
+              const next = window.AptoCloud.mergeList(dataRefs.current[c], changes);
+              dataRefs.current = { ...dataRefs.current, [c]: next };
+              setters[c](next);
+              if (c === 'sales' && !meta.initial) {
+                const added = changes.upserts.filter(s => !prevIds.has(String(s.id)));
+                if (added.length) {
+                  playCashSound();
+                  showToast(`⚡ Factura #${added[0].invoiceNumber} recibida en tiempo real desde la nube`, 'info');
+                }
+              }
+            },
+            onStatus: (s) => setCloudSyncStatus(s),
+            onError: (msg) => showToast(msg, 'info')
+          });
+        } catch (err) {
+          setCloudSyncStatus('offline');
+          return;
+        }
+        cloudRef.current = engine;
+        engine.start();
+        return () => {
+          engine.stop();
+          cloudRef.current = null;
+        };
+      }, [cloudConfig.url, cloudConfig.anonKey]);
+
+      // Cada cambio local (venta, stock, cliente, usuario) se envia a la nube
+      useEffect(() => {
+        if (cloudRef.current) cloudRef.current.notify();
+      }, [products, sales, clients, users]);
 
       // Broadcast helper across devices
       const broadcastCloudEvent = (type, payload) => {
@@ -1239,11 +1640,11 @@
                     className="flex items-center space-x-1.5 px-2.5 py-1 rounded-xl bg-brand-800 border border-brand-700 text-xs text-stone-200 hover:bg-brand-700 transition"
                   >
                     <span className="relative flex h-2 w-2">
-                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                      <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                      <span className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${cloudSyncStatus === 'offline' ? 'bg-red-400' : 'bg-emerald-400'}`}></span>
+                      <span className={`relative inline-flex rounded-full h-2 w-2 ${cloudSyncStatus === 'offline' ? 'bg-red-500' : 'bg-emerald-500'}`}></span>
                     </span>
                     <span className="hidden sm:inline font-bold text-[11px]">
-                      {cloudConfig.connected ? 'Nube PostgreSQL' : 'Sync En Vivo'}
+                      {cloudSyncStatus === 'connected' ? 'Nube conectada' : cloudSyncStatus === 'offline' ? 'Sin conexión' : 'Sincronizando…'}
                     </span>
                   </button>
 
@@ -1520,12 +1921,13 @@
         e.preventDefault();
         setTesting(true);
 
-        const cleanUrl = url.trim();
+        const cleanUrl = normalizeCloudUrl(url);
         const cleanKey = anonKey.trim();
 
         if (!cleanUrl || !cleanKey) {
-          setCloudConfig({ url: '', anonKey: '', connected: false });
-          showToast('Sincronización configurada en modo Realtime Local / Red de Tienda', 'info');
+          setCloudConfig({ url: CLOUD_DEFAULTS.url, anonKey: CLOUD_DEFAULTS.anonKey, connected: true });
+          showToast('Se restauró la conexión a la nube por defecto', 'info');
+          setTesting(false);
           onClose();
           return;
         }
@@ -1533,14 +1935,14 @@
         try {
           if (window.supabase) {
             const client = window.supabase.createClient(cleanUrl, cleanKey);
-            const { data, error } = await client.from('products').select('count', { count: 'exact', head: true });
-            
-            if (error && error.code !== 'PGRST116') {
+            const { error } = await client.from('apto_docs').select('id', { count: 'exact', head: true });
+
+            if (error) {
               throw error;
             }
 
             setCloudConfig({ url: cleanUrl, anonKey: cleanKey, connected: true });
-            showToast('¡Conexión exitosa a PostgreSQL / Supabase en la nube!', 'success');
+            showToast('¡Conexión exitosa a la nube (Supabase)!', 'success');
             onClose();
           } else {
             setCloudConfig({ url: cleanUrl, anonKey: cleanKey, connected: true });
@@ -1549,7 +1951,7 @@
           }
         } catch(err) {
           setCloudConfig({ url: cleanUrl, anonKey: cleanKey, connected: false });
-          showToast(`Aviso: Credenciales guardadas (Verifique si ejecutó schema.sql): ${err.message || ''}`, 'info');
+          showToast(`Aviso: Credenciales guardadas (Verifique si ejecutó apto_nube.sql en Supabase): ${err.message || ''}`, 'info');
           onClose();
         } finally {
           setTesting(false);
@@ -1597,7 +1999,7 @@
 
               <div>
                 <label className="block font-bold text-stone-700 uppercase mb-1">
-                  Supabase Anon Public Key:
+                  Supabase Publishable / Anon Key:
                 </label>
                 <input
                   type="password"
