@@ -1,0 +1,26 @@
+{
+  "name": "apto-erp-pos",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Sistema ERP & POS Comercial para Artículos de Cuero 'apto' con Facturación SIAT Bolivia y Sincronización Cloud",
+  "scripts": {
+    "start": "npx serve .",
+    "deploy:vercel": "npx vercel",
+    "deploy:netlify": "npx netlify deploy --prod"
+  },
+  "keywords": [
+    "erp",
+    "pos",
+    "siat",
+    "bolivia",
+    "cuero",
+    "apto",
+    "react",
+    "tailwindcss",
+    "supabase",
+    "postgresql",
+    "realtime"
+  ],
+  "author": "apto S.R.L.",
+  "license": "MIT"
+}
